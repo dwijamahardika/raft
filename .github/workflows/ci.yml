@@ -1,0 +1,24 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: {go-version-file: go.mod, cache: true}
+      - run: go vet ./...
+      # Consensus tests are timing-based; run them several times under the
+      # race detector so a flaky interleaving surfaces in CI, not production.
+      - run: go test -race -count=3 -timeout 15m ./...
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: {go-version-file: go.mod}
+      - uses: golangci/golangci-lint-action@v6
+        with: {version: latest}
