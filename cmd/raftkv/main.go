@@ -47,7 +47,9 @@ type kvStore struct {
 	waiters map[uint64][]chan uint64 // index -> chans receiving the term applied at that index
 }
 
-func newKV() *kvStore { return &kvStore{data: map[string]string{}, waiters: map[uint64][]chan uint64{}} }
+func newKV() *kvStore {
+	return &kvStore{data: map[string]string{}, waiters: map[uint64][]chan uint64{}}
+}
 
 func (s *kvStore) apply(m raft.ApplyMsg) {
 	s.mu.Lock()
@@ -126,8 +128,8 @@ func main() {
 	kv := newKV()
 	node, err := raft.New(raft.Config{
 		ID: *id, Peers: ids,
-		Transport: raft.NewRPCTransport(addrs, 500*time.Millisecond),
-		Persister: raft.FilePersister{Path: filepath.Join(*dataDir, "raft.state")},
+		Transport:       raft.NewRPCTransport(addrs, 500*time.Millisecond),
+		Persister:       raft.FilePersister{Path: filepath.Join(*dataDir, "raft.state")},
 		ElectionTimeout: 300 * time.Millisecond, HeartbeatInterval: 100 * time.Millisecond,
 		Logger: log,
 	})
