@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -303,5 +304,25 @@ func TestCommittedEntrySurvivesFailedFollowerPersist(t *testing.T) {
 		if e, ok := logAt(f2, idx); !ok || string(e.Command) != "x" {
 			t.Fatalf("entry %d (\"x\") was committed by l but new leader f2 has %+v (ok=%v): committed entry lost", idx, e, ok)
 		}
+	}
+}
+
+func TestFilePersister(t *testing.T) {
+	p := FilePersister{Path: filepath.Join(t.TempDir(), "raft.state")}
+	if b, err := p.Load(); err != nil || b != nil {
+		t.Fatalf("fresh Load = %q, %v; want nil, nil", b, err)
+	}
+	for _, want := range []string{"one", "two"} {
+		if err := p.Save([]byte(want)); err != nil {
+			t.Fatal(err)
+		}
+		if b, err := p.Load(); err != nil || string(b) != want {
+			t.Fatalf("Load = %q, %v; want %q", b, err, want)
+		}
+	}
+	// A Save that cannot reach disk must report it, so the node can fail-stop.
+	bad := FilePersister{Path: filepath.Join(t.TempDir(), "missing", "raft.state")}
+	if err := bad.Save([]byte("x")); err == nil {
+		t.Fatal("Save into a missing directory returned nil")
 	}
 }

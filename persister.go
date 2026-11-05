@@ -3,6 +3,7 @@ package raft
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 )
 
@@ -26,8 +27,10 @@ func (p *MemPersister) Load() ([]byte, error) {
 	return append([]byte(nil), p.state...), nil
 }
 
-// FilePersister writes state atomically (tmp + fsync + rename) so a crash
-// mid-save leaves the previous state intact.
+// FilePersister writes state atomically and durably: write a temp file, fsync
+// it, rename it over the old file, then fsync the directory so the rename
+// itself survives a power loss. A crash at any point leaves either the old or
+// the new state, and Save returns nil only once the new state is on disk.
 type FilePersister struct{ Path string }
 
 func (p FilePersister) Save(b []byte) error {
@@ -47,7 +50,27 @@ func (p FilePersister) Save(b []byte) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, p.Path)
+	if err := os.Rename(tmp, p.Path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(p.Path))
+}
+
+// syncDir makes a rename in dir durable. Windows cannot fsync a directory
+// (and NTFS journals renames), so it is skipped there.
+func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 func (p FilePersister) Load() ([]byte, error) {
