@@ -194,11 +194,22 @@ func main() {
 		}
 	}()
 
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case <-node.Done():
+		// The node fail-stopped because it could not persist its state.
+	}
 	shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	_ = srv.Shutdown(shCtx)
+	cancel()
 	node.Stop()
+	if err := node.Err(); err != nil {
+		// Exit non-zero so a supervisor restarts the process; the new node
+		// reloads the last state that was saved successfully.
+		log.Error("raft node halted", "err", err)
+		stop()
+		os.Exit(1)
+	}
 	log.Info("bye")
 }
 
@@ -209,6 +220,10 @@ func propose(w http.ResponseWriter, r *http.Request, node *raft.Raft, kv *kvStor
 		_, _, leader := node.Status()
 		w.Header().Set("Leader", leader)
 		http.Error(w, fmt.Sprintf("not the leader; try %q", leader), http.StatusMisdirectedRequest)
+		return
+	}
+	if err != nil { // raft.ErrStopped: the node halted (see main)
+		http.Error(w, "raft node unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
