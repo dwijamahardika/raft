@@ -25,6 +25,10 @@ type MemNetwork struct {
 
 var errUnreachable = errors.New("memnet: unreachable")
 
+// NewMemNetwork returns a fully connected, lossless network with no nodes.
+// Its random source has a fixed seed, so the sequence of drop and delay
+// decisions is reproducible; which message each one hits still depends on
+// goroutine scheduling.
 func NewMemNetwork() *MemNetwork {
 	return &MemNetwork{nodes: map[string]*Raft{}, cut: map[string]bool{}, blocked: map[[2]string]bool{}, rng: rand.New(rand.NewPCG(1, 2))}
 }
@@ -32,15 +36,20 @@ func NewMemNetwork() *MemNetwork {
 // Transport returns the per-node view of the network (so the sender is known).
 func (n *MemNetwork) Transport(from string) Transport { return &memTransport{net: n, from: from} }
 
+// Register makes r reachable as id. Registering an id again replaces the
+// previous node, which is how tests restart a crashed node at its address.
 func (n *MemNetwork) Register(id string, r *Raft) {
 	n.mu.Lock()
 	n.nodes[id] = r
 	n.mu.Unlock()
 }
 
-// Disconnect isolates a node in both directions; Connect restores it.
+// Disconnect isolates a node in both directions, as if its cable were
+// pulled; the node itself keeps running.
 func (n *MemNetwork) Disconnect(id string) { n.mu.Lock(); n.cut[id] = true; n.mu.Unlock() }
-func (n *MemNetwork) Connect(id string)    { n.mu.Lock(); delete(n.cut, id); n.mu.Unlock() }
+
+// Connect undoes Disconnect. Links blocked by Partition stay blocked.
+func (n *MemNetwork) Connect(id string) { n.mu.Lock(); delete(n.cut, id); n.mu.Unlock() }
 
 // Partition splits the cluster into groups that cannot talk across groups.
 func (n *MemNetwork) Partition(groups ...[]string) {
@@ -61,6 +70,8 @@ func (n *MemNetwork) Partition(groups ...[]string) {
 	}
 }
 
+// Heal removes the partition set by Partition. Nodes isolated with
+// Disconnect stay isolated.
 func (n *MemNetwork) Heal() { n.mu.Lock(); n.blocked = map[[2]string]bool{}; n.mu.Unlock() }
 
 // SetUnreliable drops a fraction of messages and adds random delay.
@@ -70,6 +81,9 @@ func (n *MemNetwork) SetUnreliable(dropRate float64, maxDelay time.Duration) {
 	n.mu.Unlock()
 }
 
+// Counts reports how many requests were sent and how many of them were lost
+// to a disconnect, a partition or a random drop. Replies dropped after the
+// handler ran are not counted as lost.
 func (n *MemNetwork) Counts() (sent, lost int) {
 	n.mu.Lock()
 	defer n.mu.Unlock()

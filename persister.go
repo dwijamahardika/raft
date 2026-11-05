@@ -15,6 +15,7 @@ type MemPersister struct {
 	state []byte
 }
 
+// Save implements Persister. It keeps a copy of b and never fails.
 func (p *MemPersister) Save(b []byte) error {
 	p.mu.Lock()
 	p.state = append(p.state[:0], b...)
@@ -22,6 +23,8 @@ func (p *MemPersister) Save(b []byte) error {
 	return nil
 }
 
+// Load implements Persister, returning a copy of the last saved state, or
+// nil if nothing was saved.
 func (p *MemPersister) Load() ([]byte, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -34,6 +37,9 @@ func (p *MemPersister) Load() ([]byte, error) {
 // the new state, and Save returns nil only once the new state is on disk.
 type FilePersister struct{ Path string }
 
+// Save implements Persister. It writes b to Path+".tmp", fsyncs it, renames
+// it over Path and fsyncs the directory, and returns nil only once all of that
+// succeeded. The directory must already exist; Save does not create it.
 func (p FilePersister) Save(b []byte) error {
 	tmp := p.Path + ".tmp"
 	f, err := os.Create(tmp) //nolint:gosec // G304: the path is the embedder's configured state file, not untrusted input
@@ -71,6 +77,9 @@ func syncDir(dir string) error {
 	return d.Close()
 }
 
+// Load implements Persister. A missing file means a node that never saved
+// anything, so it returns nil, nil. A Path+".tmp" left by a crash during Save
+// is ignored; the next Save overwrites it.
 func (p FilePersister) Load() ([]byte, error) {
 	b, err := os.ReadFile(p.Path)
 	if os.IsNotExist(err) {

@@ -23,11 +23,22 @@ import (
 	"time"
 )
 
+// State is a node's role in the protocol (§5.1). Stopped is terminal: a
+// halted node never changes state again.
 type State int
 
 const (
+	// Follower is the initial state. A follower only answers RPCs, and starts
+	// an election if it neither hears from a current leader nor grants a vote
+	// within its election timeout.
 	Follower State = iota
+	// Candidate is the state of a node campaigning in a new term (§5.2). It
+	// becomes Leader on votes from a majority, or Follower on hearing from a
+	// leader of its term or seeing a higher term.
 	Candidate
+	// Leader is the state of the node that won its term's election. It alone
+	// accepts proposals and replicates its log. Election Safety (§5.2): there
+	// is at most one leader per term.
 	Leader
 	// Stopped means the node no longer takes part in the protocol, either
 	// because Stop was called or because it failed to persist its state
@@ -48,6 +59,11 @@ func (s State) String() string {
 	}
 }
 
+// LogEntry is one slot of the replicated log. Index is its position (the log
+// starts with a sentinel at index 0, so real entries start at 1) and Term is
+// the leader's term when it was created. Log Matching (§5.3): two logs that
+// hold an entry with the same Index and Term are identical up to it. A nil
+// Command marks the no-op a new leader appends.
 type LogEntry struct {
 	Term    uint64
 	Index   uint64
@@ -66,6 +82,9 @@ type ApplyMsg struct {
 
 // ---- RPC types ----
 
+// RequestVoteArgs is sent by a candidate to ask for a vote in Term (§5.2).
+// LastLogIndex and LastLogTerm describe the candidate's log, so the voter can
+// apply the election restriction (§5.4.1).
 type RequestVoteArgs struct {
 	Term         uint64
 	CandidateID  string
@@ -73,11 +92,19 @@ type RequestVoteArgs struct {
 	LastLogTerm  uint64
 }
 
+// RequestVoteReply carries the voter's current term, so that a stale
+// candidate steps down, and whether it granted its vote. A node grants at most
+// one vote per term and persists it before replying.
 type RequestVoteReply struct {
 	Term        uint64
 	VoteGranted bool
 }
 
+// AppendEntriesArgs is sent by the leader of Term to replicate log entries,
+// and with no Entries as a heartbeat (§5.3). The follower accepts Entries
+// only if its log has an entry at PrevLogIndex with term PrevLogTerm.
+// LeaderCommit is the leader's commit index, which the follower adopts up to
+// the last entry it has verified matches the leader's log.
 type AppendEntriesArgs struct {
 	Term         uint64
 	LeaderID     string
@@ -87,6 +114,9 @@ type AppendEntriesArgs struct {
 	LeaderCommit uint64
 }
 
+// AppendEntriesReply carries the follower's current term, so that a stale
+// leader steps down, and whether its log matched at PrevLogIndex. A follower
+// persists the entries it appended before replying with Success.
 type AppendEntriesReply struct {
 	Term    uint64
 	Success bool
@@ -116,19 +146,40 @@ type Persister interface {
 	Load() ([]byte, error)
 }
 
+// Config configures a node for New. ID, Peers, Transport and Persister are
+// required; the other fields have defaults, applied when they are zero.
 type Config struct {
-	ID                string
-	Peers             []string // all cluster members including self
-	Transport         Transport
-	Persister         Persister
-	ElectionTimeout   time.Duration // base; actual is [base, 2*base)
+	ID string
+	// Peers lists all cluster members including ID. Every node must be given
+	// the same list: majorities are computed from it (membership changes,
+	// §6, are not supported).
+	Peers     []string
+	Transport Transport
+	Persister Persister
+	// ElectionTimeout is the base timeout; each wait is drawn at random from
+	// [base, 2*base) so nodes rarely time out together (§5.2). Default 150ms.
+	ElectionTimeout time.Duration
+	// HeartbeatInterval is how often a leader sends AppendEntries to every
+	// follower. It must be well below ElectionTimeout, or followers will start
+	// elections against a healthy leader. Default ElectionTimeout/3.
 	HeartbeatInterval time.Duration
-	Logger            *slog.Logger
+	// Logger receives the node's logs, tagged with its ID. Default
+	// slog.Default().
+	Logger *slog.Logger
 	// ApplyBuffer sizes the apply channel; a slow consumer blocks commits
-	// from being delivered but never blocks the protocol itself.
+	// from being delivered but never blocks the protocol itself. Default 256.
 	ApplyBuffer int
 }
 
+// Raft is one node of a cluster. Create it with New. It runs until Stop is
+// called or it fail-stops because persisting its state failed (see Done and
+// Err). Its methods are safe for concurrent use.
+//
+// mu guards the fields below it; applyCh, applyCond, stopCh and wg are set
+// by New and never reassigned (stopCh is closed under mu, by haltLocked).
+// Methods named *Locked must be called with mu held. The persistent fields
+// must be saved with persistLocked after each change and before anything
+// that depends on the change leaves the node.
 type Raft struct {
 	cfg    Config
 	logger *slog.Logger
@@ -158,6 +209,8 @@ type Raft struct {
 }
 
 var (
+	// ErrNotLeader is returned by Propose on a node that is not the leader.
+	// Status reports the leader it knows of, if any, to retry there.
 	ErrNotLeader = errors.New("raft: not the leader")
 	// ErrStopped is returned by Propose and the RPC handlers once the node
 	// has halted. If it halted because persisting state failed, the returned
@@ -165,6 +218,13 @@ var (
 	ErrStopped = errors.New("raft: node stopped")
 )
 
+// New starts a node as a follower, restoring currentTerm, votedFor and the
+// log from cfg.Persister. It fails if a required Config field is missing or
+// the saved state cannot be loaded. Calling New again with the same Persister
+// is how a crashed or halted node rejoins. commitIndex is not persisted, so
+// it restarts at 0 and committed entries are delivered on ApplyCh again from
+// index 1 as the node relearns the commit index; the state machine must be
+// rebuilt from them.
 func New(cfg Config) (*Raft, error) {
 	if cfg.ID == "" || len(cfg.Peers) == 0 || cfg.Transport == nil || cfg.Persister == nil {
 		return nil, errors.New("raft: ID, Peers, Transport and Persister are required")
@@ -287,6 +347,13 @@ func (r *Raft) restore() error {
 
 // Propose appends a command to the log if this node is the leader. It returns
 // immediately; commitment is signalled on ApplyCh.
+//
+// The entry is persisted before Propose returns, but it is not committed: it
+// can still be overwritten if leadership changes first. A client must treat
+// its proposal as applied only when ApplyCh delivers index with the same
+// term. cmd must be non-empty: the persisted and wire encodings (gob) turn
+// an empty command into nil, which marks a leader no-op, so it may be
+// delivered with Noop set.
 func (r *Raft) Propose(cmd []byte) (index, term uint64, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -306,6 +373,9 @@ func (r *Raft) Propose(cmd []byte) (index, term uint64, err error) {
 	return e.Index, e.Term, nil
 }
 
+// ApplyCh returns the channel on which committed entries are delivered, once
+// each and in log order. Entries with Noop set must be skipped. The channel is
+// never closed; use Done to detect that the node has halted.
 func (r *Raft) ApplyCh() <-chan ApplyMsg { return r.applyCh }
 
 // Status returns (term, state, known leader).
@@ -315,11 +385,18 @@ func (r *Raft) Status() (uint64, State, string) {
 	return r.currentTerm, r.state, r.leaderID
 }
 
+// IsLeader reports whether this node believes it is the leader. A leader cut
+// off from the majority keeps believing so until it sees a higher term, so
+// this is a hint for routing requests; only a committed entry proves the
+// leadership it was proposed under.
 func (r *Raft) IsLeader() bool {
 	_, s, _ := r.Status()
 	return s == Leader
 }
 
+// CommitIndex returns the highest log index this node knows to be committed:
+// stored on a majority and never to be overwritten (§5.4). Entries up to it
+// may not have been delivered on ApplyCh yet.
 func (r *Raft) CommitIndex() uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -395,6 +472,13 @@ func (r *Raft) majority() int { return len(r.cfg.Peers)/2 + 1 }
 // transport must then send no reply (the caller sees a failed RPC, exactly
 // as if the node had crashed).
 
+// HandleRequestVote is the receiving side of RequestVote, called by the
+// transport. It grants the vote if args.Term is at least the current term,
+// the node has not voted for another candidate in that term, and the
+// candidate's log is at least as up to date as its own (§5.2, §5.4.1). The
+// vote is persisted before the reply is returned. If the node has halted,
+// including because that persist failed, it returns an error and the
+// transport must send no reply.
 func (r *Raft) HandleRequestVote(args *RequestVoteArgs) (*RequestVoteReply, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -427,6 +511,12 @@ func (r *Raft) HandleRequestVote(args *RequestVoteArgs) (*RequestVoteReply, erro
 	return reply, nil
 }
 
+// HandleAppendEntries is the receiving side of AppendEntries, called by the
+// transport. A request from a current leader resets the election timer. If
+// the log matches at args.PrevLogIndex, entries that conflict with args are
+// truncated, missing ones appended and persisted, and the commit index
+// advanced (§5.3); otherwise the reply carries a conflict hint. Errors are as
+// for HandleRequestVote.
 func (r *Raft) HandleAppendEntries(args *AppendEntriesArgs) (*AppendEntriesReply, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
