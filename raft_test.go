@@ -529,13 +529,13 @@ func TestFollowerRejectsStaleTerm(t *testing.T) {
 			break
 		}
 	}
-	reply := f.HandleAppendEntries(&AppendEntriesArgs{Term: term - 1, LeaderID: "ghost"})
-	if reply.Success || reply.Term != term {
-		t.Fatalf("stale AppendEntries accepted: %+v", reply)
+	reply, err := f.HandleAppendEntries(&AppendEntriesArgs{Term: term - 1, LeaderID: "ghost"})
+	if err != nil || reply.Success || reply.Term != term {
+		t.Fatalf("stale AppendEntries accepted: %+v %v", reply, err)
 	}
-	vote := f.HandleRequestVote(&RequestVoteArgs{Term: term - 1, CandidateID: "ghost"})
-	if vote.VoteGranted {
-		t.Fatal("voted for stale candidate")
+	vote, err := f.HandleRequestVote(&RequestVoteArgs{Term: term - 1, CandidateID: "ghost"})
+	if err != nil || vote.VoteGranted {
+		t.Fatalf("voted for stale candidate: %+v %v", vote, err)
 	}
 }
 
@@ -551,16 +551,16 @@ func TestConflictBackup(t *testing.T) {
 	r.log = append(r.log, LogEntry{Term: 2, Index: 1}, LogEntry{Term: 3, Index: 2}, LogEntry{Term: 3, Index: 3}, LogEntry{Term: 3, Index: 4})
 	r.mu.Unlock()
 
-	reply := r.HandleAppendEntries(&AppendEntriesArgs{Term: 5, LeaderID: "l", PrevLogIndex: 4, PrevLogTerm: 4})
+	reply := mustAppend(t, r, &AppendEntriesArgs{Term: 5, LeaderID: "l", PrevLogIndex: 4, PrevLogTerm: 4})
 	if reply.Success || reply.ConflictTerm != 3 || reply.ConflictIndex != 2 {
 		t.Fatalf("want conflict term 3 first index 2, got %+v", reply)
 	}
-	reply = r.HandleAppendEntries(&AppendEntriesArgs{Term: 5, LeaderID: "l", PrevLogIndex: 9, PrevLogTerm: 4})
+	reply = mustAppend(t, r, &AppendEntriesArgs{Term: 5, LeaderID: "l", PrevLogIndex: 9, PrevLogTerm: 4})
 	if reply.Success || reply.ConflictTerm != 0 || reply.ConflictIndex != 5 {
 		t.Fatalf("want missing-index hint 5, got %+v", reply)
 	}
 	// Matching prefix + conflicting suffix is truncated and replaced.
-	reply = r.HandleAppendEntries(&AppendEntriesArgs{Term: 5, LeaderID: "l", PrevLogIndex: 1, PrevLogTerm: 2,
+	reply = mustAppend(t, r, &AppendEntriesArgs{Term: 5, LeaderID: "l", PrevLogIndex: 1, PrevLogTerm: 2,
 		Entries: []LogEntry{{Term: 5, Index: 2, Command: []byte("new")}}, LeaderCommit: 2})
 	if !reply.Success {
 		t.Fatalf("append should succeed: %+v", reply)
@@ -570,4 +570,13 @@ func TestConflictBackup(t *testing.T) {
 	if len(r.log) != 3 || r.log[2].Term != 5 || r.commitIndex != 2 {
 		t.Fatalf("log not truncated/replaced: %+v commit=%d", r.log, r.commitIndex)
 	}
+}
+
+func mustAppend(t *testing.T, r *Raft, args *AppendEntriesArgs) *AppendEntriesReply {
+	t.Helper()
+	reply, err := r.HandleAppendEntries(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reply
 }

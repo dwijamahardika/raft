@@ -93,13 +93,23 @@ func (t *RPCTransport) AppendEntries(ctx context.Context, peer string, args *App
 // RaftRPC is the net/rpc receiver; register it with rpc.RegisterName("RaftRPC", &RaftRPC{r}).
 type RaftRPC struct{ R *Raft }
 
+// A handler error (the node has halted) is returned to net/rpc, which then
+// sends the caller an error instead of a reply.
 func (s *RaftRPC) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {
-	*reply = *s.R.HandleRequestVote(args)
+	rep, err := s.R.HandleRequestVote(args)
+	if err != nil {
+		return err
+	}
+	*reply = *rep
 	return nil
 }
 
 func (s *RaftRPC) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
-	*reply = *s.R.HandleAppendEntries(args)
+	rep, err := s.R.HandleAppendEntries(args)
+	if err != nil {
+		return err
+	}
+	*reply = *rep
 	return nil
 }
 

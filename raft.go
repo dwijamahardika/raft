@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/gob"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"sort"
@@ -28,6 +29,10 @@ const (
 	Follower State = iota
 	Candidate
 	Leader
+	// Stopped means the node no longer takes part in the protocol, either
+	// because Stop was called or because it failed to persist its state
+	// (see Raft.Err).
+	Stopped
 )
 
 func (s State) String() string {
@@ -36,6 +41,8 @@ func (s State) String() string {
 		return "leader"
 	case Candidate:
 		return "candidate"
+	case Stopped:
+		return "stopped"
 	default:
 		return "follower"
 	}
@@ -100,6 +107,10 @@ type Transport interface {
 // Persister stores the durable state (currentTerm, votedFor, log). Raft
 // persists before responding to any RPC or acknowledging a proposal, which is
 // what allows a crashed node to rejoin without violating safety.
+//
+// Save must not return nil until the state is on stable storage. If Save
+// returns an error the node fail-stops: it sends no reply that depended on
+// the unsaved state and halts (see Raft.Err).
 type Persister interface {
 	Save(state []byte) error
 	Load() ([]byte, error)
@@ -139,13 +150,20 @@ type Raft struct {
 
 	applyCh   chan ApplyMsg
 	applyCond *sync.Cond
-	stopCh    chan struct{}
+	stopCh    chan struct{} // closed when the node halts; returned by Done
 	stopped   bool
+	err       error // why the node halted, if not via Stop
 	wg        sync.WaitGroup
 	rng       *rand.Rand
 }
 
-var ErrNotLeader = errors.New("raft: not the leader")
+var (
+	ErrNotLeader = errors.New("raft: not the leader")
+	// ErrStopped is returned by Propose and the RPC handlers once the node
+	// has halted. If it halted because persisting state failed, the returned
+	// error also wraps the storage error (see Raft.Err).
+	ErrStopped = errors.New("raft: node stopped")
+)
 
 func New(cfg Config) (*Raft, error) {
 	if cfg.ID == "" || len(cfg.Peers) == 0 || cfg.Transport == nil || cfg.Persister == nil {
@@ -197,17 +215,53 @@ type persistentState struct {
 	Log         []LogEntry
 }
 
-// persistLocked must be called with mu held, before any state is exposed to
-// peers (reply sent) or clients (proposal acknowledged).
-func (r *Raft) persistLocked() {
+// persistLocked saves currentTerm, votedFor and the log. It must be called
+// with mu held, after changing any of them and before anything that depends
+// on the change leaves the node: an RPC reply, an outgoing RPC, or a
+// proposal ack.
+//
+// On failure the node fail-stops (haltLocked) and the error is returned; the
+// caller must return without sending anything. Carrying on is unsafe: a node
+// that grants a vote it could not save may, after a restart, grant another
+// in the same term (two leaders); a follower that acks entries it could not
+// save lets a leader commit them on a majority that does not hold them. A
+// halted node is just a crashed node, which Raft is built to tolerate.
+func (r *Raft) persistLocked() error {
 	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(persistentState{CurrentTerm: r.currentTerm, VotedFor: r.votedFor, Log: r.log}); err != nil {
-		r.log_.Error("encode state", "err", err)
+	err := gob.NewEncoder(&buf).Encode(persistentState{CurrentTerm: r.currentTerm, VotedFor: r.votedFor, Log: r.log})
+	if err == nil {
+		err = r.cfg.Persister.Save(buf.Bytes())
+	}
+	if err != nil {
+		err = fmt.Errorf("%w: persisting state: %w", ErrStopped, err)
+		r.log_.Error("persist failed; halting node", "err", err)
+		r.haltLocked(err)
+		return err
+	}
+	return nil
+}
+
+// haltLocked takes the node out of the protocol: background loops exit, RPC
+// handlers and Propose return an error, and in-flight goroutines discard
+// their results. It does not wait for goroutines to exit (mu is held); Stop
+// does.
+func (r *Raft) haltLocked(cause error) {
+	if r.stopped {
 		return
 	}
-	if err := r.cfg.Persister.Save(buf.Bytes()); err != nil {
-		r.log_.Error("persist", "err", err)
+	r.stopped = true
+	r.err = cause
+	r.state = Stopped
+	r.leaderID = ""
+	close(r.stopCh)
+	r.applyCond.Broadcast()
+}
+
+func (r *Raft) stoppedErrLocked() error {
+	if r.err != nil {
+		return r.err
 	}
+	return ErrStopped
 }
 
 func (r *Raft) restore() error {
@@ -236,12 +290,17 @@ func (r *Raft) restore() error {
 func (r *Raft) Propose(cmd []byte) (index, term uint64, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.stopped {
+		return 0, 0, r.stoppedErrLocked()
+	}
 	if r.state != Leader {
 		return 0, 0, ErrNotLeader
 	}
 	e := LogEntry{Term: r.currentTerm, Index: r.lastIndexLocked() + 1, Command: cmd}
 	r.log = append(r.log, e)
-	r.persistLocked()
+	if err := r.persistLocked(); err != nil {
+		return 0, 0, err
+	}
 	r.matchIndex[r.cfg.ID] = e.Index
 	r.nextIndex[r.cfg.ID] = e.Index + 1
 	return e.Index, e.Term, nil
@@ -267,15 +326,27 @@ func (r *Raft) CommitIndex() uint64 {
 	return r.commitIndex
 }
 
+// Done returns a channel that is closed when the node halts: after Stop, or
+// when it fail-stops because persisting its state failed.
+func (r *Raft) Done() <-chan struct{} { return r.stopCh }
+
+// Err reports why the node halted. It is nil while the node runs and after a
+// plain Stop. After a persist failure it returns that error (wrapping
+// ErrStopped and the Persister's error): the node has stopped replying to
+// peers and clients, and to rejoin it must be recreated with New - usually by
+// restarting the process once storage is fixed - which reloads whatever the
+// Persister last saved successfully.
+func (r *Raft) Err() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.err
+}
+
+// Stop halts the node and waits for its background goroutines to exit. It is
+// safe to call more than once, and after the node has fail-stopped.
 func (r *Raft) Stop() {
 	r.mu.Lock()
-	if r.stopped {
-		r.mu.Unlock()
-		return
-	}
-	r.stopped = true
-	close(r.stopCh)
-	r.applyCond.Broadcast()
+	r.haltLocked(nil)
 	r.mu.Unlock()
 	r.wg.Wait()
 }
@@ -292,17 +363,22 @@ func (r *Raft) termAtLocked(index uint64) (uint64, bool) {
 	return r.log[index].Term, true
 }
 
-func (r *Raft) becomeFollowerLocked(term uint64, leader string) {
+// becomeFollowerLocked returns a non-nil error only if persisting a new term
+// failed, in which case the node has halted.
+func (r *Raft) becomeFollowerLocked(term uint64, leader string) error {
 	if term > r.currentTerm {
 		r.currentTerm = term
 		r.votedFor = ""
-		r.persistLocked()
+		if err := r.persistLocked(); err != nil {
+			return err
+		}
 	}
 	if r.state != Follower {
 		r.log_.Info("stepping down", "term", term, "from", r.state.String())
 	}
 	r.state = Follower
 	r.leaderID = leader
+	return nil
 }
 
 func (r *Raft) electionTimeoutLocked() time.Duration {
@@ -313,16 +389,26 @@ func (r *Raft) electionTimeoutLocked() time.Duration {
 func (r *Raft) majority() int { return len(r.cfg.Peers)/2 + 1 }
 
 // ---- RPC handlers (invoked by the transport) ----
+//
+// A handler returns an error instead of a reply once the node has halted,
+// including when persisting the state the reply would depend on fails. The
+// transport must then send no reply (the caller sees a failed RPC, exactly
+// as if the node had crashed).
 
-func (r *Raft) HandleRequestVote(args *RequestVoteArgs) *RequestVoteReply {
+func (r *Raft) HandleRequestVote(args *RequestVoteArgs) (*RequestVoteReply, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.stopped {
+		return nil, r.stoppedErrLocked()
+	}
 	reply := &RequestVoteReply{Term: r.currentTerm}
 	if args.Term < r.currentTerm {
-		return reply
+		return reply, nil
 	}
 	if args.Term > r.currentTerm {
-		r.becomeFollowerLocked(args.Term, "")
+		if err := r.becomeFollowerLocked(args.Term, ""); err != nil {
+			return nil, err
+		}
 		reply.Term = r.currentTerm
 	}
 	// Election restriction (§5.4.1): only vote for a candidate whose log is at
@@ -332,23 +418,30 @@ func (r *Raft) HandleRequestVote(args *RequestVoteArgs) *RequestVoteReply {
 		(args.LastLogTerm == r.lastTermLocked() && args.LastLogIndex >= r.lastIndexLocked())
 	if (r.votedFor == "" || r.votedFor == args.CandidateID) && upToDate {
 		r.votedFor = args.CandidateID
-		r.persistLocked()
+		if err := r.persistLocked(); err != nil {
+			return nil, err
+		}
 		r.lastHeard = time.Now()
 		reply.VoteGranted = true
 	}
-	return reply
+	return reply, nil
 }
 
-func (r *Raft) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply {
+func (r *Raft) HandleAppendEntries(args *AppendEntriesArgs) (*AppendEntriesReply, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.stopped {
+		return nil, r.stoppedErrLocked()
+	}
 	reply := &AppendEntriesReply{Term: r.currentTerm}
 	if args.Term < r.currentTerm {
-		return reply
+		return reply, nil
 	}
 	// A valid leader for this term exists: reset the election clock and
 	// (if we were candidate/leader for an older term) step down.
-	r.becomeFollowerLocked(args.Term, args.LeaderID)
+	if err := r.becomeFollowerLocked(args.Term, args.LeaderID); err != nil {
+		return nil, err
+	}
 	reply.Term = r.currentTerm
 	r.lastHeard = time.Now()
 
@@ -357,7 +450,7 @@ func (r *Raft) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply 
 	if !ok {
 		reply.ConflictIndex = r.lastIndexLocked() + 1
 		reply.ConflictTerm = 0
-		return reply
+		return reply, nil
 	}
 	if prevTerm != args.PrevLogTerm {
 		reply.ConflictTerm = prevTerm
@@ -366,7 +459,7 @@ func (r *Raft) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply 
 			i--
 		}
 		reply.ConflictIndex = i
-		return reply
+		return reply, nil
 	}
 	// Append new entries, truncating on the first conflict. Entries that
 	// already match are left alone so a stale duplicate RPC cannot roll back
@@ -386,7 +479,9 @@ func (r *Raft) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply 
 		break
 	}
 	if changed {
-		r.persistLocked()
+		if err := r.persistLocked(); err != nil {
+			return nil, err
+		}
 	}
 	if args.LeaderCommit > r.commitIndex {
 		last := args.PrevLogIndex + uint64(len(args.Entries))
@@ -394,7 +489,7 @@ func (r *Raft) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply 
 		r.applyCond.Broadcast()
 	}
 	reply.Success = true
-	return reply
+	return reply, nil
 }
 
 // ---- election ----
@@ -411,7 +506,7 @@ func (r *Raft) electionLoop() {
 		case <-time.After(timeout / 4):
 		}
 		r.mu.Lock()
-		if r.state != Leader && time.Since(r.lastHeard) >= timeout {
+		if !r.stopped && r.state != Leader && time.Since(r.lastHeard) >= timeout {
 			r.startElectionLocked()
 		}
 		r.mu.Unlock()
@@ -424,7 +519,11 @@ func (r *Raft) startElectionLocked() {
 	r.votedFor = r.cfg.ID
 	r.leaderID = ""
 	r.lastHeard = time.Now()
-	r.persistLocked()
+	// The self-vote counts toward the majority, so it must be durable before
+	// any RequestVote goes out.
+	if err := r.persistLocked(); err != nil {
+		return
+	}
 	term := r.currentTerm
 	args := &RequestVoteArgs{Term: term, CandidateID: r.cfg.ID, LastLogIndex: r.lastIndexLocked(), LastLogTerm: r.lastTermLocked()}
 	r.log_.Debug("starting election", "term", term)
@@ -444,8 +543,11 @@ func (r *Raft) startElectionLocked() {
 			}
 			r.mu.Lock()
 			defer r.mu.Unlock()
+			if r.stopped {
+				return
+			}
 			if reply.Term > r.currentTerm {
-				r.becomeFollowerLocked(reply.Term, "")
+				_ = r.becomeFollowerLocked(reply.Term, "") // on error the node has halted
 				return
 			}
 			if r.state != Candidate || r.currentTerm != term || !reply.VoteGranted {
@@ -476,7 +578,9 @@ func (r *Raft) becomeLeaderLocked() {
 	// proposal - which could be never. etcd and others do the same.
 	noop := LogEntry{Term: r.currentTerm, Index: r.lastIndexLocked() + 1}
 	r.log = append(r.log, noop)
-	r.persistLocked()
+	if err := r.persistLocked(); err != nil {
+		return // halted; never announce leadership on a log we could not save
+	}
 	r.matchIndex[r.cfg.ID] = r.lastIndexLocked()
 	r.nextIndex[r.cfg.ID] = r.lastIndexLocked() + 1
 	r.log_.Info("became leader", "term", r.currentTerm, "lastIndex", r.lastIndexLocked())
@@ -497,7 +601,7 @@ func (r *Raft) heartbeatLoop() {
 		case <-t.C:
 		}
 		r.mu.Lock()
-		if r.state == Leader {
+		if !r.stopped && r.state == Leader {
 			r.broadcastLocked()
 		}
 		r.mu.Unlock()
@@ -541,8 +645,11 @@ func (r *Raft) replicate(peer string) {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.stopped {
+		return
+	}
 	if reply.Term > r.currentTerm {
-		r.becomeFollowerLocked(reply.Term, "")
+		_ = r.becomeFollowerLocked(reply.Term, "") // on error the node has halted
 		return
 	}
 	if r.state != Leader || r.currentTerm != term {

@@ -117,7 +117,10 @@ func (t *memTransport) RequestVote(ctx context.Context, peer string, args *Reque
 	if err := sleepCtx(ctx, delay); err != nil {
 		return nil, err
 	}
-	reply := target.HandleRequestVote(args)
+	reply, err := target.HandleRequestVote(args)
+	if err != nil {
+		return nil, err // the node halted: no reply, as if it had crashed
+	}
 	if t.net.replyLost() {
 		return nil, errUnreachable
 	}
@@ -132,7 +135,10 @@ func (t *memTransport) AppendEntries(ctx context.Context, peer string, args *App
 	if err := sleepCtx(ctx, delay); err != nil {
 		return nil, err
 	}
-	reply := target.HandleAppendEntries(args)
+	reply, err := target.HandleAppendEntries(args)
+	if err != nil {
+		return nil, err // the node halted: no reply, as if it had crashed
+	}
 	if t.net.replyLost() {
 		return nil, errUnreachable
 	}
