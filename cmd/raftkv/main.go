@@ -98,6 +98,13 @@ func (s *kvStore) get(k string) (string, bool) {
 }
 
 func main() {
+	os.Exit(run())
+}
+
+// run is main's body. It returns the exit code instead of calling os.Exit so
+// that its deferred cleanup always runs: 2 for bad flags, 1 if the node could
+// not start or halted because persisting its state failed, 0 otherwise.
+func run() int {
 	id := flag.String("id", "", "this node's id")
 	peers := flag.String("peers", "", "id=host:port,... for all nodes (raft transport)")
 	httpAddr := flag.String("http", ":8001", "HTTP listen address")
@@ -105,24 +112,27 @@ func main() {
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	addrs := map[string]string{}
-	var ids []string
-	for _, p := range strings.Split(*peers, ",") {
+	entries := strings.Split(*peers, ",")
+	addrs := make(map[string]string, len(entries))
+	ids := make([]string, 0, len(entries))
+	for _, p := range entries {
 		nid, addr, ok := strings.Cut(strings.TrimSpace(p), "=")
 		if !ok {
 			log.Error("bad -peers entry", "entry", p)
-			os.Exit(2)
+			return 2
 		}
 		addrs[nid] = addr
 		ids = append(ids, nid)
 	}
 	if _, ok := addrs[*id]; !ok {
 		log.Error("-id must appear in -peers")
-		os.Exit(2)
+		return 2
 	}
-	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
+	// The directory holds this node's vote and log; nobody else needs to
+	// read it, let alone write it.
+	if err := os.MkdirAll(*dataDir, 0o750); err != nil {
 		log.Error("data dir", "err", err)
-		os.Exit(1)
+		return 1
 	}
 
 	kv := newKV()
@@ -135,7 +145,7 @@ func main() {
 	})
 	if err != nil {
 		log.Error("raft", "err", err)
-		os.Exit(1)
+		return 1
 	}
 	go func() {
 		for m := range node.ApplyCh() {
@@ -146,10 +156,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	ln, err := net.Listen("tcp", addrs[*id])
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addrs[*id])
 	if err != nil {
 		log.Error("listen", "err", err)
-		os.Exit(1)
+		return 1
 	}
 	go func() {
 		if err := raft.Serve(ctx, ln, node); err != nil {
@@ -207,10 +217,10 @@ func main() {
 		// Exit non-zero so a supervisor restarts the process; the new node
 		// reloads the last state that was saved successfully.
 		log.Error("raft node halted", "err", err)
-		stop()
-		os.Exit(1)
+		return 1
 	}
 	log.Info("bye")
+	return 0
 }
 
 func propose(w http.ResponseWriter, r *http.Request, node *raft.Raft, kv *kvStore, c command) {
