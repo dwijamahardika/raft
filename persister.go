@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -35,17 +36,15 @@ type FilePersister struct{ Path string }
 
 func (p FilePersister) Save(b []byte) error {
 	tmp := p.Path + ".tmp"
-	f, err := os.Create(tmp)
+	f, err := os.Create(tmp) //nolint:gosec // G304: the path is the embedder's configured state file, not untrusted input
 	if err != nil {
 		return err
 	}
 	if _, err := f.Write(b); err != nil {
-		f.Close()
-		return err
+		return errors.Join(err, f.Close())
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
+		return errors.Join(err, f.Close())
 	}
 	if err := f.Close(); err != nil {
 		return err
@@ -62,13 +61,12 @@ func syncDir(dir string) error {
 	if runtime.GOOS == "windows" {
 		return nil
 	}
-	d, err := os.Open(dir)
+	d, err := os.Open(dir) //nolint:gosec // G304: dir is the parent of the embedder's configured state file
 	if err != nil {
 		return err
 	}
 	if err := d.Sync(); err != nil {
-		d.Close()
-		return err
+		return errors.Join(err, d.Close())
 	}
 	return d.Close()
 }
@@ -80,5 +78,3 @@ func (p FilePersister) Load() ([]byte, error) {
 	}
 	return b, err
 }
-
-func (p FilePersister) ensureDir() error { return os.MkdirAll(filepath.Dir(p.Path), 0o755) }
