@@ -17,9 +17,9 @@ The library is transport- and storage-agnostic. `cmd/raftkv` runs a real 3-node 
 | Commit safety | A leader advances `commitIndex` only over entries of **its own term** stored on a majority (§5.4.2, the "Figure 8" rule). A **no-op entry on election** ensures earlier-term entries get committed promptly instead of waiting for the next client write — the same trick etcd uses. | `advanceCommitLocked`, `becomeLeaderLocked` |
 | Durability | `currentTerm`, `votedFor` and the log are persisted **before** any RPC reply, vote request or proposal ack. If a save fails the node **fail-stops**: it sends nothing that depended on the unsaved state, leaves the protocol (state `stopped`; RPCs and `Propose` return `ErrStopped`) and reports the cause via `Done()` / `Err()`; `raftkv` then exits non-zero. `FilePersister` writes atomically and durably (tmp + fsync + rename + directory fsync). Nodes crash and restart mid-test without violating safety. | `persistLocked`, `haltLocked`, `persister.go` |
 | Fault injection | `MemNetwork`: per-node disconnect, arbitrary **partitions**, probabilistic message loss (request *and* reply), random latency, message counters. Deterministic seed. | `memnet.go` |
-| Real transport | `net/rpc` over TCP with per-peer connection cache and re-dial on failure; context-driven timeouts. | `rpcnet.go` |
+| Real transport | `net/rpc` over TCP with per-peer connection cache and re-dial on failure; context-driven timeouts, including for the dial. | `rpcnet.go` |
 | Client semantics | `Propose` returns `(index, term)`; the demo waits for that index to apply and checks the term still matches — if a leader change overwrote the entry, the client is told to retry rather than getting a silent false ack. | `cmd/raftkv` |
-| Testing | Stable initial election; re-election after leader isolation and old-leader step-down; agreement with a follower down and catch-up on rejoin; **no agreement without a majority**; 30 concurrent proposals with identical logs on all nodes; persistence across a full-cluster crash; **minority-leader entries overwritten** after partition heals; agreement under 15% loss + jitter; unit tests for stale-term rejection and conflict hints; **failing-disk tests** (a node whose save fails must not vote, ack or campaign, and must halt). Every test asserts "at most one leader per term" and "no gaps in applied indexes". | `raft_test.go`, `failstop_test.go` |
+| Testing | Stable initial election; re-election after leader isolation and old-leader step-down; agreement with a follower down and catch-up on rejoin; **no agreement without a majority**; 30 concurrent proposals with identical logs on all nodes; persistence across a full-cluster crash; **minority-leader entries overwritten** after partition heals; agreement under 15% loss + jitter; unit tests for stale-term rejection and conflict hints; **failing-disk tests** (a node whose save fails must not vote, ack or campaign, and must halt); both RPCs over real TCP through `RPCTransport` and `Serve`. Every cluster test asserts "at most one leader per term" and "no gaps in applied indexes". | `raft_test.go`, `failstop_test.go`, `rpcnet_test.go` |
 
 Zero dependencies.
 
@@ -56,6 +56,7 @@ rpcnet.go         net/rpc transport + server
 persister.go      in-memory and atomic-file persisters
 raft_test.go      cluster harness and scenario tests
 failstop_test.go  persist-failure (fail-stop) tests
+rpcnet_test.go    TCP transport round trip; dials bounded by the RPC context
 cmd/raftkv/       3-node replicated KV over TCP with HTTP API
 ```
 
