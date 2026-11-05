@@ -130,8 +130,8 @@ type Config struct {
 }
 
 type Raft struct {
-	cfg  Config
-	log_ *slog.Logger
+	cfg    Config
+	logger *slog.Logger
 
 	mu sync.Mutex
 	// persistent
@@ -183,7 +183,7 @@ func New(cfg Config) (*Raft, error) {
 	}
 	r := &Raft{
 		cfg:        cfg,
-		log_:       cfg.Logger.With("node", cfg.ID),
+		logger:     cfg.Logger.With("node", cfg.ID),
 		log:        []LogEntry{{}},
 		state:      Follower,
 		lastHeard:  time.Now(),
@@ -234,7 +234,7 @@ func (r *Raft) persistLocked() error {
 	}
 	if err != nil {
 		err = fmt.Errorf("%w: persisting state: %w", ErrStopped, err)
-		r.log_.Error("persist failed; halting node", "err", err)
+		r.logger.Error("persist failed; halting node", "err", err)
 		r.haltLocked(err)
 		return err
 	}
@@ -374,7 +374,7 @@ func (r *Raft) becomeFollowerLocked(term uint64, leader string) error {
 		}
 	}
 	if r.state != Follower {
-		r.log_.Info("stepping down", "term", term, "from", r.state.String())
+		r.logger.Info("stepping down", "term", term, "from", r.state.String())
 	}
 	r.state = Follower
 	r.leaderID = leader
@@ -471,8 +471,7 @@ func (r *Raft) HandleAppendEntries(args *AppendEntriesArgs) (*AppendEntriesReply
 			if r.log[idx].Term == e.Term {
 				continue
 			}
-			r.log = r.log[:idx]
-			changed = true
+			r.log = r.log[:idx] // conflict: drop this entry and all that follow it
 		}
 		r.log = append(r.log, args.Entries[i:]...)
 		changed = true
@@ -526,7 +525,7 @@ func (r *Raft) startElectionLocked() {
 	}
 	term := r.currentTerm
 	args := &RequestVoteArgs{Term: term, CandidateID: r.cfg.ID, LastLogIndex: r.lastIndexLocked(), LastLogTerm: r.lastTermLocked()}
-	r.log_.Debug("starting election", "term", term)
+	r.logger.Debug("starting election", "term", term)
 
 	votes := 1
 	var once sync.Once
@@ -583,7 +582,7 @@ func (r *Raft) becomeLeaderLocked() {
 	}
 	r.matchIndex[r.cfg.ID] = r.lastIndexLocked()
 	r.nextIndex[r.cfg.ID] = r.lastIndexLocked() + 1
-	r.log_.Info("became leader", "term", r.currentTerm, "lastIndex", r.lastIndexLocked())
+	r.logger.Info("became leader", "term", r.currentTerm, "lastIndex", r.lastIndexLocked())
 	// Send an immediate heartbeat to assert leadership and ship the no-op.
 	r.broadcastLocked()
 }

@@ -138,18 +138,6 @@ func (c *cluster) waitLeader() *Raft {
 	return nil
 }
 
-func (c *cluster) checkNoLeader() {
-	c.t.Helper()
-	time.Sleep(3 * electionTO)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for id, r := range c.nodes {
-		if _, st, _ := r.Status(); st == Leader && !c.net.cut[id] {
-			c.t.Fatalf("%s is leader without a majority", id)
-		}
-	}
-}
-
 // propose submits via the current leader, retrying across leader changes.
 func (c *cluster) propose(cmd string) uint64 {
 	c.t.Helper()
